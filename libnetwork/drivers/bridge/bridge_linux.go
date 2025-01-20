@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net"
 	"net/netip"
+	"os"
 	"strconv"
 	"sync"
 
@@ -170,6 +171,7 @@ const (
 func newDriver(store *datastore.Store) *driver {
 	return &driver{
 		store:    store,
+		nlh:      ns.NlHandle(),
 		networks: map[string]*bridgeNetwork{},
 	}
 }
@@ -640,7 +642,7 @@ func parseNetworkGenericOptions(data interface{}) (*networkConfiguration, error)
 	return config, err
 }
 
-func (c *networkConfiguration) processIPAM(id string, ipamV4Data, ipamV6Data []driverapi.IPAMData) error {
+func (c *networkConfiguration) processIPAM(ipamV4Data, ipamV6Data []driverapi.IPAMData) error {
 	if len(ipamV4Data) > 1 || len(ipamV6Data) > 1 {
 		return types.ForbiddenErrorf("bridge driver doesn't support multiple subnets")
 	}
@@ -745,7 +747,20 @@ func (d *driver) DecodeTableEntry(tablename string, key string, value []byte) (s
 	return "", nil
 }
 
-// Create a new network using bridge plugin
+func (d *driver) GetSkipGwAlloc(opts options.Generic) (ipv4, ipv6 bool, _ error) {
+	// The network doesn't exist yet, so use a dummy id that's long enough to be
+	// truncated to a short-id (12 characters) and used in the bridge device name.
+	cfg, err := parseNetworkOptions("dummyNetworkId", opts)
+	if err != nil {
+		return false, false, err
+	}
+	// cfg.InhibitIPv4 means no gateway address will be assigned to the bridge, if
+	// the network is also cfg.Internal, there will not be a default route to use
+	// the gateway address either.
+	return cfg.InhibitIPv4 && cfg.Internal, false, nil
+}
+
+// CreateNetwork creates a new network using the bridge driver.
 func (d *driver) CreateNetwork(id string, option map[string]interface{}, nInfo driverapi.NetworkInfo, ipV4Data, ipV6Data []driverapi.IPAMData) error {
 	// Sanity checks
 	d.Lock()
@@ -772,7 +787,7 @@ func (d *driver) CreateNetwork(id string, option map[string]interface{}, nInfo d
 	}
 
 	// Add IP addresses/gateways to the configuration.
-	if err = config.processIPAM(id, ipV4Data, ipV6Data); err != nil {
+	if err = config.processIPAM(ipV4Data, ipV6Data); err != nil {
 		return err
 	}
 
@@ -814,13 +829,6 @@ func (d *driver) checkConflict(config *networkConfiguration) error {
 }
 
 func (d *driver) createNetwork(config *networkConfiguration) (err error) {
-	// Initialize handle when needed
-	d.Lock()
-	if d.nlh.Handle == nil {
-		d.nlh = ns.NlHandle()
-	}
-	d.Unlock()
-
 	// Create or retrieve the bridge L3 interface
 	bridgeIface, err := newInterface(d.nlh, config)
 	if err != nil {
@@ -959,6 +967,13 @@ func (d *driver) createNetwork(config *networkConfiguration) (err error) {
 
 	// Apply the prepared list of steps, and abort at the first error.
 	bridgeSetup.queueStep(setupDeviceUp)
+
+	if v := os.Getenv("DOCKER_TEST_BRIDGE_INIT_ERROR"); v == config.BridgeName {
+		bridgeSetup.queueStep(func(n *networkConfiguration, b *bridgeInterface) error {
+			return fmt.Errorf("DOCKER_TEST_BRIDGE_INIT_ERROR is %q", v)
+		})
+	}
+
 	return bridgeSetup.apply()
 }
 
@@ -978,6 +993,18 @@ func (d *driver) deleteNetwork(nid string) error {
 	d.Unlock()
 
 	if !ok {
+		// If the network was successfully created by an earlier incarnation of the daemon,
+		// but it failed to initialise this time, the network is still in the store (in
+		// case whatever caused the failure can be fixed for a future daemon restart). But,
+		// it's not in d.networks. To prevent the driver's state from getting out of step
+		// with its parent, make sure it's not in the store before reporting that it does
+		// not exist.
+		if err := d.storeDelete(&networkConfiguration{ID: nid}); err != nil && err != datastore.ErrKeyNotFound {
+			log.G(context.TODO()).WithFields(log.Fields{
+				"error":   err,
+				"network": nid,
+			}).Warnf("Failed to delete network from bridge store")
+		}
 		return types.InternalMaskableErrorf("network %s does not exist", nid)
 	}
 

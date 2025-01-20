@@ -97,7 +97,7 @@ type Controller struct {
 	agentInitDone    chan struct{}
 	agentStopDone    chan struct{}
 	keys             []*types.EncryptionKey
-	DiagnosticServer *diagnostic.Server
+	diagnosticServer *diagnostic.Server
 	mu               sync.Mutex
 
 	// FIXME(thaJeztah): defOsSbox is always nil on non-Linux: move these fields to Linux-only files.
@@ -122,7 +122,7 @@ func New(cfgOptions ...config.Option) (*Controller, error) {
 		serviceBindings:  make(map[serviceKey]*service),
 		agentInitDone:    make(chan struct{}),
 		networkLocker:    locker.New(),
-		DiagnosticServer: diagnostic.New(),
+		diagnosticServer: diagnostic.New(),
 	}
 
 	c.drvRegistry.Notify = c
@@ -155,10 +155,11 @@ func New(cfgOptions ...config.Option) (*Controller, error) {
 	// generate many unnecessary warnings
 	c.reservePools()
 
-	// Cleanup resources
-	if err := c.sandboxCleanup(c.cfg.ActiveSandboxes); err != nil {
+	if err := c.sandboxRestore(c.cfg.ActiveSandboxes); err != nil {
 		log.G(context.TODO()).WithError(err).Error("error during sandbox cleanup")
 	}
+
+	// Cleanup resources
 	if err := c.cleanupLocalEndpoints(); err != nil {
 		log.G(context.TODO()).WithError(err).Warnf("error during endpoint cleanup")
 	}
@@ -561,8 +562,14 @@ func (c *Controller) NewNetwork(networkType, name string, id string, options ...
 
 	// Make sure we have a driver available for this network type
 	// before we allocate anything.
-	if _, err := nw.driver(true); err != nil {
+	if d, err := nw.driver(true); err != nil {
 		return nil, err
+	} else if gac, ok := d.(driverapi.GwAllocChecker); ok {
+		// Give the driver a chance to say it doesn't need a gateway IP address.
+		nw.skipGwAllocIPv4, nw.skipGwAllocIPv6, err = gac.GetSkipGwAlloc(nw.generic)
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	// From this point on, we need the network specific configuration,
@@ -1086,25 +1093,15 @@ func (c *Controller) Stop() {
 
 // StartDiagnostic starts the network diagnostic server listening on port.
 func (c *Controller) StartDiagnostic(port int) {
-	c.mu.Lock()
-	if !c.DiagnosticServer.IsDiagnosticEnabled() {
-		c.DiagnosticServer.EnableDiagnostic("127.0.0.1", port)
-	}
-	c.mu.Unlock()
+	c.diagnosticServer.Enable("127.0.0.1", port)
 }
 
 // StopDiagnostic stops the network diagnostic server.
 func (c *Controller) StopDiagnostic() {
-	c.mu.Lock()
-	if c.DiagnosticServer.IsDiagnosticEnabled() {
-		c.DiagnosticServer.DisableDiagnostic()
-	}
-	c.mu.Unlock()
+	c.diagnosticServer.Shutdown()
 }
 
 // IsDiagnosticEnabled returns true if the diagnostic server is running.
 func (c *Controller) IsDiagnosticEnabled() bool {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return c.DiagnosticServer.IsDiagnosticEnabled()
+	return c.diagnosticServer.Enabled()
 }
