@@ -37,15 +37,17 @@ type EndpointInfo interface {
 
 // EndpointInterface holds interface addresses bound to the endpoint.
 type EndpointInterface struct {
-	mac       net.HardwareAddr
-	addr      *net.IPNet
-	addrv6    *net.IPNet
-	llAddrs   []*net.IPNet
-	srcName   string
-	dstPrefix string
-	routes    []*net.IPNet
-	v4PoolID  string
-	v6PoolID  string
+	mac                net.HardwareAddr
+	addr               *net.IPNet
+	addrv6             *net.IPNet
+	llAddrs            []*net.IPNet
+	srcName            string
+	dstPrefix          string
+	routes             []*net.IPNet
+	v4PoolID           string
+	v6PoolID           string
+	netnsPath          string
+	createdInContainer bool
 }
 
 func (epi *EndpointInterface) MarshalJSON() ([]byte, error) {
@@ -75,6 +77,7 @@ func (epi *EndpointInterface) MarshalJSON() ([]byte, error) {
 	epMap["routes"] = routes
 	epMap["v4PoolID"] = epi.v4PoolID
 	epMap["v6PoolID"] = epi.v6PoolID
+	epMap["createdInContainer"] = epi.createdInContainer
 	return json.Marshal(epMap)
 }
 
@@ -132,6 +135,9 @@ func (epi *EndpointInterface) UnmarshalJSON(b []byte) error {
 	epi.v4PoolID = epMap["v4PoolID"].(string)
 	epi.v6PoolID = epMap["v6PoolID"].(string)
 
+	if v, ok := epMap["createdInContainer"]; ok {
+		epi.createdInContainer = v.(bool)
+	}
 	return nil
 }
 
@@ -143,6 +149,7 @@ func (epi *EndpointInterface) CopyTo(dstEpi *EndpointInterface) error {
 	dstEpi.dstPrefix = epi.dstPrefix
 	dstEpi.v4PoolID = epi.v4PoolID
 	dstEpi.v6PoolID = epi.v6PoolID
+	dstEpi.createdInContainer = epi.createdInContainer
 	if len(epi.llAddrs) != 0 {
 		dstEpi.llAddrs = make([]*net.IPNet, 0, len(epi.llAddrs))
 		dstEpi.llAddrs = append(dstEpi.llAddrs, epi.llAddrs...)
@@ -269,6 +276,18 @@ func (epi *EndpointInterface) SetNames(srcName string, dstPrefix string) error {
 	return nil
 }
 
+// NetnsPath returns the path of the network namespace, if there is one. Else "".
+func (epi *EndpointInterface) NetnsPath() string {
+	return epi.netnsPath
+}
+
+// SetCreatedInContainer can be called by the driver to indicate that it's
+// created the network interface in the container's network namespace (so,
+// it doesn't need to be moved there).
+func (epi *EndpointInterface) SetCreatedInContainer(cic bool) {
+	epi.createdInContainer = cic
+}
+
 func (ep *Endpoint) InterfaceName() driverapi.InterfaceNameInfo {
 	ep.mu.Lock()
 	defer ep.mu.Unlock()
@@ -383,28 +402,37 @@ func (ep *Endpoint) SetGatewayIPv6(gw6 net.IP) error {
 }
 
 // hasGatewayOrDefaultRoute returns true if ep has a gateway, or a route to '0.0.0.0'/'::'.
-func (ep *Endpoint) hasGatewayOrDefaultRoute() bool {
+func (ep *Endpoint) hasGatewayOrDefaultRoute() (v4, v6 bool) {
 	ep.mu.Lock()
 	defer ep.mu.Unlock()
 
 	if ep.joinInfo != nil {
-		if len(ep.joinInfo.gw) > 0 || len(ep.joinInfo.gw6) > 0 {
-			return true
-		}
-		for _, route := range ep.joinInfo.StaticRoutes {
-			if route.Destination.IP.IsUnspecified() && net.IP(route.Destination.Mask).IsUnspecified() {
-				return true
+		v4 = len(ep.joinInfo.gw) > 0
+		v6 = len(ep.joinInfo.gw6) > 0
+		if !v4 || !v6 {
+			for _, route := range ep.joinInfo.StaticRoutes {
+				if route.Destination.IP.IsUnspecified() && net.IP(route.Destination.Mask).IsUnspecified() {
+					if route.Destination.IP.To4() == nil {
+						v6 = true
+					} else {
+						v4 = true
+					}
+				}
 			}
 		}
 	}
-	if ep.iface != nil {
+	if ep.iface != nil && (!v4 || !v6) {
 		for _, route := range ep.iface.routes {
 			if route.IP.IsUnspecified() && net.IP(route.Mask).IsUnspecified() {
-				return true
+				if route.IP.To4() == nil {
+					v6 = true
+				} else {
+					v4 = true
+				}
 			}
 		}
 	}
-	return false
+	return v4, v6
 }
 
 func (ep *Endpoint) retrieveFromStore() (*Endpoint, error) {
